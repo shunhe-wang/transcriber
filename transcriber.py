@@ -14,7 +14,7 @@ import datetime
 import warnings
 import wave
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import numpy as np
 
 # Suppress harmless Python 3.13 resource_tracker warning on exit
@@ -329,6 +329,63 @@ class Recorder:
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────
+SUMMARY_TEMPLATES = {
+    "General Meeting": (
+        "You are a professional meeting summarizer. Summarize the following meeting transcript.\n\n"
+        "Include:\n"
+        "- Meeting title and date\n"
+        "- Key discussion points\n"
+        "- Decisions made\n"
+        "- Action items (with owners if identifiable)\n"
+        "- Any open questions or follow-ups\n\n"
+        "Be concise but thorough. Use bullet points.\n\n"
+    ),
+    "Client Call": (
+        "You are a legal assistant summarizing a client call transcript.\n\n"
+        "Include:\n"
+        "- Client name and matter (if identifiable)\n"
+        "- Key facts or updates the client shared\n"
+        "- Legal questions raised\n"
+        "- Advice or guidance given\n"
+        "- Next steps and deadlines discussed\n"
+        "- Any documents or information the client needs to provide\n\n"
+        "Use professional language suitable for a case file.\n\n"
+    ),
+    "Deposition / Witness": (
+        "You are a legal assistant summarizing a deposition or witness interview transcript.\n\n"
+        "Include:\n"
+        "- Witness / deponent name and role (if identifiable)\n"
+        "- Key testimony points and admissions\n"
+        "- Contradictions or inconsistencies noted\n"
+        "- Important exhibits or documents referenced\n"
+        "- Areas that may need follow-up questioning\n"
+        "- Notable objections\n\n"
+        "Organize chronologically. Flag any statements that could be impeachment material.\n\n"
+    ),
+    "Internal / Strategy": (
+        "You are a legal assistant summarizing an internal team meeting.\n\n"
+        "Include:\n"
+        "- Matter or case discussed\n"
+        "- Strategy decisions and rationale\n"
+        "- Research or drafting assignments\n"
+        "- Deadlines and court dates mentioned\n"
+        "- Budget or staffing considerations\n"
+        "- Action items with responsible attorneys\n\n"
+        "This is privileged work product — label it as such at the top.\n\n"
+    ),
+    "Voice Memo": (
+        "You are a professional assistant. The following is a voice memo / dictation transcript.\n\n"
+        "Clean it up into well-organized notes:\n"
+        "- Fix any obvious transcription errors\n"
+        "- Organize into logical sections\n"
+        "- Extract any action items or to-dos\n"
+        "- Preserve all substantive content\n\n"
+        "Keep the author's voice and intent.\n\n"
+    ),
+    "Custom": None,  # user edits the prompt directly
+}
+
+
 class App(tk.Tk):
     ACCENT   = "#E8FF6B"
     BG       = "#0D0D0D"
@@ -346,24 +403,26 @@ class App(tk.Tk):
         self.title("Meeting Transcriber")
         self.configure(bg=self.BG)
         self.resizable(True, True)
-        self.geometry("780x800")
-        self.minsize(640, 640)
+        self.geometry("900x820")
+        self.minsize(780, 640)
 
         self._recorder          = Recorder()
         self._wav_path          = None
         self._model             = None
         self._model_name_loaded = None
         self._model_lock        = threading.Lock()
-        self._model_name        = tk.StringVar(value="base")
+        self._model_name        = tk.StringVar(value="medium")
         self._language_var      = tk.StringVar(value="en")
         self._sys_device_var    = tk.IntVar(value=-1)
         self._mic_device_var    = tk.IntVar(value=-1)   # -1 = mic off
         self._status_var        = tk.StringVar(value="Ready")
         self._title_var         = tk.StringVar(value="")
+        self._meeting_type_var  = tk.StringVar(value="General Meeting")
         self._timer_id          = None
         self._elapsed           = 0
         self._recording         = False
         self._transcribing      = False
+        self._cancel_transcription = threading.Event()
         self._segments          = []
         self._rec_duration      = 0.0
         self._rec_started_at    = None
@@ -525,6 +584,13 @@ class App(tk.Tk):
         self._style_dropdown(lang_menu, width=12)
         lang_menu.grid(row=3, column=2, sticky="w", padx=(32, 0), pady=(4, 0))
 
+        # ── Summary template selector ──
+        tk.Label(inner, text="SUMMARY TYPE", font=("Menlo", 9, "bold"),
+                 fg=self.DIM, bg=self.PANEL).grid(row=4, column=1, sticky="w", padx=(32, 0), pady=(8, 0))
+        type_menu = tk.OptionMenu(inner, self._meeting_type_var, *SUMMARY_TEMPLATES.keys())
+        self._style_dropdown(type_menu, width=18)
+        type_menu.grid(row=5, column=1, sticky="w", padx=(32, 0), pady=(4, 0))
+
         # ── Hint text ──
         tk.Label(inner,
                  text="System Audio captures Zoom/Teams.  Mic captures your voice.  Both are mixed for transcription.",
@@ -567,7 +633,17 @@ class App(tk.Tk):
             relief="flat", padx=24, pady=12, cursor="hand2",
             state="disabled", command=self._save_transcript
         )
-        self._save_btn.pack(side="left")
+        self._save_btn.pack(side="left", padx=(0, 12))
+
+        self._copy_btn = tk.Button(
+            btn_row, text="📋  COPY PROMPT",
+            font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
+            activebackground="#d4eb55", activeforeground=self.BG,
+            disabledforeground=self.DIM,
+            relief="flat", padx=24, pady=12, cursor="hand2",
+            state="disabled", command=self._copy_summary_prompt
+        )
+        self._copy_btn.pack(side="left")
 
         # ── Status bar ──
         self._status_lbl = tk.Label(self, textvariable=self._status_var,
@@ -652,6 +728,7 @@ class App(tk.Tk):
                                 activebackground="#cc3333")
         self._trans_btn.configure(state="disabled")
         self._save_btn.configure(state="disabled")
+        self._copy_btn.configure(state="disabled")
         self._timer_label.configure(fg=self.RED)
 
         mode = "sys + mic" if mic_arg is not None else "single device"
@@ -712,10 +789,18 @@ class App(tk.Tk):
 
     # ── Transcription ──────────────────────────────────────────────────────
     def _start_transcribe(self):
-        if self._transcribing or not self._wav_path:
+        if self._transcribing:
+            # Button acts as cancel during transcription
+            self._cancel_transcription.set()
+            self._set_status("Cancelling transcription…", color=self.DIM)
+            self._trans_btn.configure(state="disabled")
+            return
+        if not self._wav_path:
             return
         self._transcribing = True
-        self._trans_btn.configure(state="disabled")
+        self._cancel_transcription.clear()
+        self._trans_btn.configure(text="⏹  CANCEL", bg=self.RED, fg=self.TEXT,
+                                  activebackground="#cc3333")
         self._set_status("Loading Whisper model… (first run downloads the model, may take a minute)")
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
@@ -726,12 +811,25 @@ class App(tk.Tk):
         threading.Thread(target=self._transcribe_worker,
                          args=(model_name, language), daemon=True).start()
 
+    def _reset_trans_btn(self):
+        """Restore TRANSCRIBE button to its normal state."""
+        self._trans_btn.configure(
+            text="✦  TRANSCRIBE", bg=self.ACCENT, fg=self.BG,
+            activebackground="#d4eb55", state="normal"
+        )
+
     def _transcribe_worker(self, model_name, language):
         try:
             with self._model_lock:
                 if self._model is None or self._model_name_loaded != model_name:
                     self._model             = whisper.load_model(model_name)
                     self._model_name_loaded = model_name
+
+            # Check cancel after (potentially slow) model load
+            if self._cancel_transcription.is_set():
+                self.after(0, lambda: self._set_status("Transcription cancelled — recording still available.", color=self.DIM))
+                self.after(0, self._reset_trans_btn)
+                return
 
             self.after(0, lambda: self._set_status("Transcribing audio…"))
 
@@ -743,13 +841,20 @@ class App(tk.Tk):
                 verbose=False,
                 condition_on_previous_text=False,
             )
+
+            # Check cancel after transcription (Whisper runs synchronously)
+            if self._cancel_transcription.is_set():
+                self.after(0, lambda: self._set_status("Transcription cancelled — recording still available.", color=self.DIM))
+                self.after(0, self._reset_trans_btn)
+                return
+
             transcript = result["text"].strip()
             segments   = result.get("segments", [])
             self.after(0, lambda: self._show_transcript(transcript, segments))
         except Exception as e:
             err = str(e)
             self.after(0, lambda: self._set_status(f"Error: {err}", color=self.RED))
-            self.after(0, lambda: self._trans_btn.configure(state="normal"))
+            self.after(0, self._reset_trans_btn)
         finally:
             self._transcribing = False
 
@@ -765,15 +870,59 @@ class App(tk.Tk):
                 "or the mic is picking up sound).")
             self._text.configure(state="disabled")
             self._set_status("⚠ Transcription returned empty — no speech detected", color=self.RED)
-            self._trans_btn.configure(state="normal")
+            self._reset_trans_btn()
             return
 
         self._text.insert("1.0", text)
         self._text.configure(state="disabled")
         self._save_btn.configure(state="normal")
+        self._copy_btn.configure(state="normal")
         words = len(text.split())
         self._set_status(f"Transcription complete — {words} words", color=self.ACCENT)
-        self._trans_btn.configure(state="normal")
+        self._reset_trans_btn()
+        self._ding()
+
+    # ── Copy summary prompt to clipboard ──────────────────────────────────
+    def _copy_summary_prompt(self):
+        transcript = self._text.get("1.0", "end").strip()
+        if not transcript:
+            return
+
+        meeting_type = self._meeting_type_var.get()
+        template = SUMMARY_TEMPLATES.get(meeting_type)
+
+        if meeting_type == "Custom" or template is None:
+            # Open a simple dialog for custom prompt
+            custom = simpledialog.askstring(
+                "Custom Prompt",
+                "Enter your summary instructions:",
+                parent=self,
+                initialvalue="Summarize the following transcript:\n"
+            )
+            if not custom:
+                return
+            template = custom + "\n\n"
+
+        # Build metadata header
+        title = self._title_var.get().strip()
+        meta_parts = []
+        if title:
+            meta_parts.append(f"Meeting title: {title}")
+        if self._rec_started_at:
+            meta_parts.append(f"Date: {self._rec_started_at.strftime('%Y-%m-%d %H:%M')}")
+        if self._rec_duration:
+            mins = int(self._rec_duration // 60)
+            meta_parts.append(f"Duration: {mins} minutes")
+        meta = "\n".join(meta_parts)
+        if meta:
+            meta = meta + "\n\n"
+
+        prompt = f"{template}{meta}--- TRANSCRIPT ---\n\n{transcript}"
+
+        self.clipboard_clear()
+        self.clipboard_append(prompt)
+        self.update()  # required for clipboard to persist on macOS
+        self._set_status(f"Copied to clipboard — paste into ChatGPT or Claude ({meeting_type})", color=self.ACCENT)
 
     # ── Save ───────────────────────────────────────────────────────────────
     def _save_transcript(self):
@@ -878,6 +1027,18 @@ class App(tk.Tk):
     def _set_status(self, msg, color=None):
         self._status_var.set(msg)
         self._status_lbl.configure(fg=color or self.DIM)
+
+    @staticmethod
+    def _ding():
+        """Play a system notification sound (macOS)."""
+        import subprocess
+        try:
+            subprocess.Popen(
+                ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
