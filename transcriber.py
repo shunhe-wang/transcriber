@@ -2,7 +2,7 @@
 """
 Meeting Transcriber — local Whisper-based recorder for macOS
 Records from one or two audio devices (system audio + mic), mixes to mono,
-then transcribes offline using OpenAI Whisper.
+or imports an existing audio file, then transcribes offline using OpenAI Whisper.
 """
 
 import json
@@ -625,6 +625,16 @@ class App(tk.Tk):
         )
         self._trans_btn.pack(side="left", padx=(0, 12))
 
+        self._import_btn = tk.Button(
+            btn_row, text="↑  IMPORT AUDIO",
+            font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
+            activebackground="#d4eb55", activeforeground=self.BG,
+            disabledforeground=self.DIM,
+            relief="flat", padx=24, pady=12, cursor="hand2",
+            command=self._import_audio_file
+        )
+        self._import_btn.pack(side="left", padx=(0, 12))
+
         self._save_btn = tk.Button(
             btn_row, text="↓  SAVE",
             font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
@@ -687,6 +697,72 @@ class App(tk.Tk):
         self._populate_devices()
         self._set_status("Device list refreshed")
 
+    def _clear_transcript_state(self, message=None):
+        self._segments = []
+        self._save_btn.configure(state="disabled")
+        self._copy_btn.configure(state="disabled")
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        if message:
+            self._text.insert("1.0", message)
+        self._text.configure(state="disabled")
+
+    def _import_audio_file(self):
+        if self._recording or self._transcribing:
+            return
+
+        path = filedialog.askopenfilename(
+            title="Import audio file",
+            filetypes=[
+                ("Audio files", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
+                ("MP3 files", "*.mp3"),
+                ("WAV files", "*.wav"),
+                ("M4A files", "*.m4a"),
+                ("AAC files", "*.aac"),
+                ("FLAC files", "*.flac"),
+                ("OGG files", "*.ogg"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        if not os.path.isfile(path):
+            messagebox.showerror(
+                "Import Error",
+                "That file no longer exists. Please choose another audio file."
+            )
+            self._set_status("Import failed — selected file was not found.", color=self.RED)
+            return
+
+        try:
+            with open(path, "rb"):
+                pass
+        except OSError as e:
+            messagebox.showerror(
+                "Import Error",
+                f"That file could not be read.\n\n{e}"
+            )
+            self._set_status("Import failed — selected file could not be read.", color=self.RED)
+            return
+
+        self._wav_path = path
+        self._rec_duration = 0.0
+        self._rec_started_at = None
+        self._rec_stopped_at = None
+        self._trans_btn.configure(state="normal")
+        self._clear_transcript_state(
+            f"Imported audio file:\n{os.path.basename(path)}\n\nClick TRANSCRIBE to begin."
+        )
+
+        if not self._title_var.get().strip():
+            self._title_var.set(os.path.splitext(os.path.basename(path))[0])
+
+        self._set_status(
+            f"Imported {os.path.basename(path)} — ready to transcribe.",
+            color=self.ACCENT
+        )
+
     # ── Recording ──────────────────────────────────────────────────────────
     def _toggle_recording(self):
         if not self._recording:
@@ -695,8 +771,18 @@ class App(tk.Tk):
             self._stop_recording()
 
     def _start_recording(self):
+        if self._wav_path and not self._segments and self._save_btn.cget("state") == "disabled":
+            replace_audio = messagebox.askyesno(
+                "Replace pending audio?",
+                "You already have audio ready to transcribe.\n\n"
+                "Starting a new recording will replace that pending audio. Continue?"
+            )
+            if not replace_audio:
+                return
+
         self._recorder.cleanup()
         self._wav_path = None
+        self._clear_transcript_state("Transcript will appear here after you record and transcribe…")
 
         sys_dev = self._sys_device_var.get()
         mic_dev = self._mic_device_var.get()
@@ -726,6 +812,7 @@ class App(tk.Tk):
         self._rec_stopped_at = None
         self._rec_btn.configure(text="⏹  STOP RECORDING", bg=self.RED, fg=self.TEXT,
                                 activebackground="#cc3333")
+        self._import_btn.configure(state="disabled")
         self._trans_btn.configure(state="disabled")
         self._save_btn.configure(state="disabled")
         self._copy_btn.configure(state="disabled")
@@ -743,6 +830,7 @@ class App(tk.Tk):
 
         self._rec_btn.configure(text="⏺  START RECORDING", bg=self.ACCENT, fg=self.BG,
                                 activebackground="#d4eb55")
+        self._import_btn.configure(state="normal")
         self._timer_label.configure(fg=self.TEXT)
         self._set_status("Stopping — flushing audio to disk…")
         self.update_idletasks()
@@ -799,6 +887,7 @@ class App(tk.Tk):
             return
         self._transcribing = True
         self._cancel_transcription.clear()
+        self._import_btn.configure(state="disabled")
         self._trans_btn.configure(text="⏹  CANCEL", bg=self.RED, fg=self.TEXT,
                                   activebackground="#cc3333")
         self._set_status("Loading Whisper model… (first run downloads the model, may take a minute)")
@@ -813,6 +902,7 @@ class App(tk.Tk):
 
     def _reset_trans_btn(self):
         """Restore TRANSCRIBE button to its normal state."""
+        self._import_btn.configure(state="normal")
         self._trans_btn.configure(
             text="✦  TRANSCRIBE", bg=self.ACCENT, fg=self.BG,
             activebackground="#d4eb55", state="normal"
