@@ -452,6 +452,7 @@ class App(tk.Tk):
         self._elapsed           = 0
         self._recording         = False
         self._recording_paused  = False
+        self._recording_session_open = False
         self._transcribing      = False
         self._cancel_transcription = threading.Event()
         self._segments          = []
@@ -634,8 +635,31 @@ class App(tk.Tk):
         self._timer_label.pack(pady=(20, 0))
 
         # ── Buttons ──
-        btn_row = tk.Frame(self, bg=self.BG)
-        btn_row.pack(pady=20)
+        btn_wrap = tk.Frame(self, bg=self.BG)
+        btn_wrap.pack(fill="x", padx=24, pady=20)
+
+        btn_canvas = tk.Canvas(
+            btn_wrap, bg=self.BG, highlightthickness=0, bd=0, height=58
+        )
+        btn_canvas.pack(side="top", fill="x", expand=True)
+
+        btn_scroll = tk.Scrollbar(
+            btn_wrap, orient="horizontal", command=btn_canvas.xview
+        )
+        btn_scroll.pack(side="top", fill="x")
+        btn_canvas.configure(xscrollcommand=btn_scroll.set)
+
+        btn_row = tk.Frame(btn_canvas, bg=self.BG)
+        btn_window = btn_canvas.create_window((0, 0), window=btn_row, anchor="nw")
+
+        def _update_button_scrollregion(_event=None):
+            btn_canvas.configure(scrollregion=btn_canvas.bbox("all"))
+
+        def _resize_button_canvas(_event):
+            btn_canvas.itemconfigure(btn_window, height=_event.height)
+
+        btn_row.bind("<Configure>", _update_button_scrollregion)
+        btn_canvas.bind("<Configure>", _resize_button_canvas)
 
         self._rec_btn = tk.Button(
             btn_row, text="⏺  START RECORDING",
@@ -645,16 +669,6 @@ class App(tk.Tk):
             command=self._toggle_recording
         )
         self._rec_btn.pack(side="left", padx=(0, 12))
-
-        self._pause_btn = tk.Button(
-            btn_row, text="⏸  PAUSE",
-            font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
-            activebackground="#d4eb55", activeforeground=self.BG,
-            disabledforeground=self.DIM,
-            relief="flat", padx=24, pady=12, cursor="hand2",
-            state="disabled", command=self._toggle_pause_recording
-        )
-        self._pause_btn.pack(side="left", padx=(0, 12))
 
         self._trans_btn = tk.Button(
             btn_row, text="✦  TRANSCRIBE",
@@ -666,6 +680,16 @@ class App(tk.Tk):
         )
         self._trans_btn.pack(side="left", padx=(0, 12))
 
+        self._save_btn = tk.Button(
+            btn_row, text="↓  SAVE",
+            font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
+            activebackground="#d4eb55", activeforeground=self.BG,
+            disabledforeground=self.DIM,
+            relief="flat", padx=24, pady=12, cursor="hand2",
+            state="disabled", command=self._save_transcript
+        )
+        self._save_btn.pack(side="left", padx=(0, 12))
+
         self._import_btn = tk.Button(
             btn_row, text="↑  IMPORT AUDIO",
             font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
@@ -676,15 +700,15 @@ class App(tk.Tk):
         )
         self._import_btn.pack(side="left", padx=(0, 12))
 
-        self._save_btn = tk.Button(
-            btn_row, text="↓  SAVE",
+        self._new_btn = tk.Button(
+            btn_row, text="＋  NEW RECORDING",
             font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
             activebackground="#d4eb55", activeforeground=self.BG,
             disabledforeground=self.DIM,
             relief="flat", padx=24, pady=12, cursor="hand2",
-            state="disabled", command=self._save_transcript
+            state="disabled", command=self._start_new_recording
         )
-        self._save_btn.pack(side="left", padx=(0, 12))
+        self._new_btn.pack(side="left", padx=(0, 12))
 
         self._copy_btn = tk.Button(
             btn_row, text="📋  COPY PROMPT",
@@ -748,9 +772,69 @@ class App(tk.Tk):
             self._text.insert("1.0", message)
         self._text.configure(state="disabled")
 
+    def _has_pending_audio(self):
+        return bool(self._wav_path and not self._segments and self._save_btn.cget("state") == "disabled")
+
+    def _set_new_recording_button(self, enabled):
+        self._new_btn.configure(state="normal" if enabled else "disabled")
+
+    def _discard_pending_recording_session(self):
+        self._recorder.cleanup()
+        self._recording_session_open = False
+        self._recording = False
+        self._recording_paused = False
+        self._wav_path = None
+        self._set_new_recording_button(False)
+
+    def _finalize_pending_recording(self):
+        if not self._recording_session_open:
+            return True
+
+        if self._timer_id:
+            self.after_cancel(self._timer_id)
+            self._timer_id = None
+
+        self._recording = False
+        self._recording_paused = False
+
+        try:
+            self._wav_path = self._recorder.stop()
+        except Exception as e:
+            messagebox.showerror("Recording Error", f"Failed to save recording:\n{e}")
+            self._set_status("Recording error — audio may be lost.", color=self.RED)
+            self._recording_session_open = False
+            return False
+
+        self._recording_session_open = False
+        self._rec_stopped_at = datetime.datetime.now()
+        self._rec_duration = self._recorder.duration
+        self._elapsed = int(self._rec_duration)
+        self._timer_label.configure(text=self._fmt(self._elapsed), fg=self.TEXT)
+
+        if not self._wav_path:
+            self._trans_btn.configure(state="disabled")
+            self._set_new_recording_button(False)
+            self._set_status(
+                "No audio captured — check that the selected devices are receiving audio.",
+                color=self.RED
+            )
+            return False
+
+        return True
+
     def _import_audio_file(self):
         if self._recording or self._transcribing:
             return
+
+        if self._has_pending_audio():
+            replace_audio = messagebox.askyesno(
+                "Replace pending audio?",
+                "You already have audio ready to transcribe.\n\n"
+                "Importing a file will replace that pending audio. Continue?"
+            )
+            if not replace_audio:
+                return
+            self._discard_pending_recording_session()
 
         path = filedialog.askopenfilename(
             title="Import audio file",
@@ -788,10 +872,13 @@ class App(tk.Tk):
             return
 
         self._wav_path = path
+        self._recording_session_open = False
+        self._recording_paused = False
         self._rec_duration = 0.0
         self._rec_started_at = None
         self._rec_stopped_at = None
         self._trans_btn.configure(state="normal")
+        self._set_new_recording_button(True)
         self._clear_transcript_state(
             f"Imported audio file:\n{os.path.basename(path)}\n\nClick TRANSCRIBE to begin."
         )
@@ -806,19 +893,30 @@ class App(tk.Tk):
 
     # ── Recording ──────────────────────────────────────────────────────────
     def _toggle_recording(self):
-        if not self._recording and not self._recording_paused:
-            self._start_recording()
-        else:
-            self._stop_recording()
-
-    def _toggle_pause_recording(self):
+        if self._transcribing:
+            return
         if self._recording:
-            self._pause_recording()
-        elif self._recording_paused:
+            self._stop_recording()
+        elif self._recording_paused and self._recording_session_open:
             self._resume_recording()
+        else:
+            self._start_recording()
 
-    def _start_recording(self):
-        if self._wav_path and not self._segments and self._save_btn.cget("state") == "disabled":
+    def _start_new_recording(self):
+        if self._recording or self._transcribing or not self._has_pending_audio():
+            return
+
+        replace_audio = messagebox.askyesno(
+            "Start a new recording?",
+            "This will discard the pending audio and start a brand-new recording. Continue?"
+        )
+        if not replace_audio:
+            return
+
+        self._start_recording(force_new=True)
+
+    def _start_recording(self, force_new=False):
+        if self._has_pending_audio() and not force_new:
             replace_audio = messagebox.askyesno(
                 "Replace pending audio?",
                 "You already have audio ready to transcribe.\n\n"
@@ -827,6 +925,7 @@ class App(tk.Tk):
             if not replace_audio:
                 return
 
+        self._discard_pending_recording_session()
         self._recorder.cleanup()
         self._wav_path = None
         self._clear_transcript_state("Transcript will appear here after you record and transcribe…")
@@ -853,17 +952,20 @@ class App(tk.Tk):
             messagebox.showerror("Recording Error", err)
             return
 
+        self._recording_session_open = True
         self._recording      = True
         self._recording_paused = False
         self._elapsed        = 0
         self._rec_started_at = datetime.datetime.now()
         self._rec_stopped_at = None
+        self._rec_duration = 0.0
+        self._wav_path = self._recorder.wav_path
         self._timer_label.configure(text="00:00:00")
-        self._rec_btn.configure(text="⏹  STOP & SAVE", bg=self.RED, fg=self.TEXT,
+        self._rec_btn.configure(text="⏹  STOP RECORDING", bg=self.RED, fg=self.TEXT,
                                 activebackground="#cc3333")
-        self._pause_btn.configure(state="normal", text="⏸  PAUSE")
         self._import_btn.configure(state="disabled")
         self._trans_btn.configure(state="disabled")
+        self._set_new_recording_button(False)
         self._save_btn.configure(state="disabled")
         self._copy_btn.configure(state="disabled")
         self._timer_label.configure(fg=self.RED)
@@ -872,7 +974,24 @@ class App(tk.Tk):
         self._set_status(f"Recording ({mode})…")
         self._tick()
 
-    def _pause_recording(self):
+    def _resume_recording(self):
+        if not self._recording_paused or not self._recording_session_open:
+            return
+        try:
+            self._recorder.resume()
+        except Exception as e:
+            messagebox.showerror("Recording Error", f"Failed to resume recording:\n{e}")
+            return
+
+        self._recording = True
+        self._recording_paused = False
+        self._rec_btn.configure(text="⏹  STOP RECORDING", bg=self.RED, fg=self.TEXT,
+                                activebackground="#cc3333")
+        self._timer_label.configure(fg=self.RED)
+        self._set_status("Recording resumed…")
+        self._tick()
+
+    def _stop_recording(self):
         if not self._recording:
             return
         if self._timer_id:
@@ -885,78 +1004,21 @@ class App(tk.Tk):
             messagebox.showerror("Recording Error", f"Failed to pause recording:\n{e}")
             return
 
+        self._rec_duration = self._recorder.duration
+        self._wav_path = self._recorder.wav_path
         self._recording = False
         self._recording_paused = True
-        self._rec_duration = self._recorder.duration
         self._elapsed = int(self._rec_duration)
-        self._pause_btn.configure(text="▶  RESUME")
-        self._timer_label.configure(text=self._fmt(self._elapsed))
-        self._timer_label.configure(fg=self.ACCENT)
-        self._set_status("Recording paused — resume to keep adding to the same file.", color=self.ACCENT)
-
-    def _resume_recording(self):
-        if not self._recording_paused:
-            return
-        try:
-            self._recorder.resume()
-        except Exception as e:
-            messagebox.showerror("Recording Error", f"Failed to resume recording:\n{e}")
-            return
-
-        self._recording = True
-        self._recording_paused = False
-        self._pause_btn.configure(text="⏸  PAUSE")
-        self._timer_label.configure(fg=self.RED)
-        self._set_status("Recording resumed…")
-        self._tick()
-
-    def _stop_recording(self):
-        self._recording = False
-        self._recording_paused = False
-        if self._timer_id:
-            self.after_cancel(self._timer_id)
-            self._timer_id = None
-
-        self._rec_btn.configure(text="⏺  START RECORDING", bg=self.ACCENT, fg=self.BG,
+        self._rec_btn.configure(text="▶  CONTINUE RECORDING", bg=self.ACCENT, fg=self.BG,
                                 activebackground="#d4eb55")
-        self._pause_btn.configure(state="disabled", text="⏸  PAUSE")
+        self._trans_btn.configure(state="normal")
+        self._set_new_recording_button(True)
         self._import_btn.configure(state="normal")
-        self._timer_label.configure(fg=self.TEXT)
-        self._set_status("Stopping — flushing audio to disk…")
-        self.update_idletasks()
-
-        try:
-            self._wav_path = self._recorder.stop()
-        except Exception as e:
-            err = str(e)
-            messagebox.showerror("Recording Error", f"Failed to save recording:\n{err}")
-            self._set_status("Recording error — audio may be lost.", color=self.RED)
-            return
-
-        self._rec_stopped_at = datetime.datetime.now()
-        self._rec_duration = self._recorder.duration
-        self._elapsed = int(self._rec_duration)
-        self._timer_label.configure(text=self._fmt(self._elapsed))
-        dropped  = self._recorder.dropped_chunks
-        warnings = self._recorder.stream_warnings
-
-        if self._wav_path:
-            self._trans_btn.configure(state="normal")
-            dur_str = self._fmt(int(self._rec_duration))
-            msg = f"Recording saved ({dur_str}). Ready to transcribe."
-            has_issues = False
-            if dropped > 0:
-                msg += f" ⚠ {dropped} chunks dropped."
-                has_issues = True
-            if warnings > 0:
-                msg += f" ⚠ {warnings} stream warnings."
-                has_issues = True
-            self._set_status(msg, color=self.RED if has_issues else None)
-        else:
-            self._set_status(
-                "No audio captured — check that the selected devices are receiving audio.",
-                color=self.RED
-            )
+        self._timer_label.configure(text=self._fmt(self._elapsed), fg=self.ACCENT)
+        self._set_status(
+            f"Recording paused ({self._fmt(self._elapsed)}). Click CONTINUE RECORDING to keep going or TRANSCRIBE to finish.",
+            color=self.ACCENT
+        )
 
     def _tick(self):
         self._elapsed += 1
@@ -983,9 +1045,12 @@ class App(tk.Tk):
             return
         if not self._wav_path:
             return
+        if not self._finalize_pending_recording():
+            return
         self._transcribing = True
         self._cancel_transcription.clear()
-        self._pause_btn.configure(state="disabled")
+        self._rec_btn.configure(state="disabled")
+        self._set_new_recording_button(False)
         self._import_btn.configure(state="disabled")
         self._trans_btn.configure(text="⏹  CANCEL", bg=self.RED, fg=self.TEXT,
                                   activebackground="#cc3333")
@@ -1001,7 +1066,11 @@ class App(tk.Tk):
 
     def _reset_trans_btn(self):
         """Restore TRANSCRIBE button to its normal state."""
-        self._pause_btn.configure(state="disabled", text="⏸  PAUSE")
+        self._rec_btn.configure(
+            text="⏺  START RECORDING", bg=self.ACCENT, fg=self.BG,
+            activebackground="#d4eb55", state="normal"
+        )
+        self._set_new_recording_button(False)
         self._import_btn.configure(state="normal")
         self._trans_btn.configure(
             text="✦  TRANSCRIBE", bg=self.ACCENT, fg=self.BG,
