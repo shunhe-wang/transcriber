@@ -56,6 +56,7 @@ class Recorder:
         self._sys_stream      = None
         self._mic_stream      = None
         self._running         = False
+        self._capturing       = False
         self._wav_path        = None
         self._wf              = None
         self._writer_thread   = None
@@ -67,6 +68,8 @@ class Recorder:
         self._sys_rate        = None
         self._mic_rate        = None
         self._dual            = False
+        self._sys_device      = None
+        self._mic_device      = None
 
     # ── device enumeration ─────────────────────────────────────────────────
     def list_devices(self):
@@ -81,6 +84,9 @@ class Recorder:
     # ── start / stop ───────────────────────────────────────────────────────
     def start(self, sys_device, mic_device=None):
         """Begin recording.  mic_device=None → single-device mode."""
+        self._q = queue.Queue(maxsize=self.QUEUE_MAXSIZE)
+        self._sys_device = sys_device
+        self._mic_device = mic_device
 
         # ── system audio device ──
         sys_info       = sounddevice.query_devices(sys_device)
@@ -113,6 +119,7 @@ class Recorder:
         self._stream_warnings = 0
         self._writer_error    = None
         self._running         = True
+        self._capturing       = False
 
         # ── writer / mixer thread ──
         self._writer_thread = threading.Thread(
@@ -120,12 +127,26 @@ class Recorder:
         )
         self._writer_thread.start()
 
+        self.resume()
+
+    def pause(self):
+        """Pause capture while keeping the current WAV open for resume."""
+        if not self._running or not self._capturing:
+            return
+        self._capturing = False
+        self._close_streams()
+
+    def resume(self):
+        """Resume capture into the existing WAV."""
+        if not self._running or self._capturing:
+            return
+
         # ── open audio streams ──
         self._sys_stream = sounddevice.InputStream(
             samplerate=self._sys_rate,
-            channels=sys_channels,
+            channels=int(sounddevice.query_devices(self._sys_device)["max_input_channels"]),
             dtype="float32",
-            device=sys_device,
+            device=self._sys_device,
             callback=self._sys_callback,
         )
         self._sys_stream.start()
@@ -133,23 +154,19 @@ class Recorder:
         if self._dual:
             self._mic_stream = sounddevice.InputStream(
                 samplerate=self._mic_rate,
-                channels=mic_channels,
+                channels=int(sounddevice.query_devices(self._mic_device)["max_input_channels"]),
                 dtype="float32",
-                device=mic_device,
+                device=self._mic_device,
                 callback=self._mic_callback,
             )
             self._mic_stream.start()
+        self._capturing = True
 
     def stop(self) -> str | None:
         """Stop recording, flush to disk, return WAV path (or None)."""
+        self._capturing = False
         self._running = False
-
-        for stream_attr in ("_sys_stream", "_mic_stream"):
-            stream = getattr(self, stream_attr)
-            if stream:
-                stream.stop()
-                stream.close()
-                setattr(self, stream_attr, None)
+        self._close_streams()
 
         if self._writer_thread:
             self._writer_thread.join(timeout=10)
@@ -180,7 +197,7 @@ class Recorder:
     def _sys_callback(self, indata, frames, time, status):
         if status:
             self._stream_warnings += 1
-        if self._running:
+        if self._capturing:
             try:
                 self._q.put_nowait(("sys", indata.copy()))
             except queue.Full:
@@ -189,7 +206,7 @@ class Recorder:
     def _mic_callback(self, indata, frames, time, status):
         if status:
             self._stream_warnings += 1
-        if self._running:
+        if self._capturing:
             try:
                 self._q.put_nowait(("mic", indata.copy()))
             except queue.Full:
@@ -308,12 +325,25 @@ class Recorder:
         self._cleanup_wav()
 
     def _cleanup_wav(self):
+        self._close_streams()
+        self._running = False
+        self._capturing = False
         if self._wav_path and os.path.exists(self._wav_path):
             try:
                 os.unlink(self._wav_path)
             except OSError:
                 pass
         self._wav_path = None
+        self._sys_device = None
+        self._mic_device = None
+
+    def _close_streams(self):
+        for stream_attr in ("_sys_stream", "_mic_stream"):
+            stream = getattr(self, stream_attr)
+            if stream:
+                stream.stop()
+                stream.close()
+                setattr(self, stream_attr, None)
 
     @property
     def duration(self):
@@ -421,6 +451,7 @@ class App(tk.Tk):
         self._timer_id          = None
         self._elapsed           = 0
         self._recording         = False
+        self._recording_paused  = False
         self._transcribing      = False
         self._cancel_transcription = threading.Event()
         self._segments          = []
@@ -615,6 +646,16 @@ class App(tk.Tk):
         )
         self._rec_btn.pack(side="left", padx=(0, 12))
 
+        self._pause_btn = tk.Button(
+            btn_row, text="⏸  PAUSE",
+            font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
+            activebackground="#d4eb55", activeforeground=self.BG,
+            disabledforeground=self.DIM,
+            relief="flat", padx=24, pady=12, cursor="hand2",
+            state="disabled", command=self._toggle_pause_recording
+        )
+        self._pause_btn.pack(side="left", padx=(0, 12))
+
         self._trans_btn = tk.Button(
             btn_row, text="✦  TRANSCRIBE",
             font=self.FONT_BTN, fg=self.BG, bg=self.ACCENT,
@@ -765,10 +806,16 @@ class App(tk.Tk):
 
     # ── Recording ──────────────────────────────────────────────────────────
     def _toggle_recording(self):
-        if not self._recording:
+        if not self._recording and not self._recording_paused:
             self._start_recording()
         else:
             self._stop_recording()
+
+    def _toggle_pause_recording(self):
+        if self._recording:
+            self._pause_recording()
+        elif self._recording_paused:
+            self._resume_recording()
 
     def _start_recording(self):
         if self._wav_path and not self._segments and self._save_btn.cget("state") == "disabled":
@@ -807,11 +854,14 @@ class App(tk.Tk):
             return
 
         self._recording      = True
+        self._recording_paused = False
         self._elapsed        = 0
         self._rec_started_at = datetime.datetime.now()
         self._rec_stopped_at = None
-        self._rec_btn.configure(text="⏹  STOP RECORDING", bg=self.RED, fg=self.TEXT,
+        self._timer_label.configure(text="00:00:00")
+        self._rec_btn.configure(text="⏹  STOP & SAVE", bg=self.RED, fg=self.TEXT,
                                 activebackground="#cc3333")
+        self._pause_btn.configure(state="normal", text="⏸  PAUSE")
         self._import_btn.configure(state="disabled")
         self._trans_btn.configure(state="disabled")
         self._save_btn.configure(state="disabled")
@@ -822,14 +872,54 @@ class App(tk.Tk):
         self._set_status(f"Recording ({mode})…")
         self._tick()
 
+    def _pause_recording(self):
+        if not self._recording:
+            return
+        if self._timer_id:
+            self.after_cancel(self._timer_id)
+            self._timer_id = None
+
+        try:
+            self._recorder.pause()
+        except Exception as e:
+            messagebox.showerror("Recording Error", f"Failed to pause recording:\n{e}")
+            return
+
+        self._recording = False
+        self._recording_paused = True
+        self._rec_duration = self._recorder.duration
+        self._elapsed = int(self._rec_duration)
+        self._pause_btn.configure(text="▶  RESUME")
+        self._timer_label.configure(text=self._fmt(self._elapsed))
+        self._timer_label.configure(fg=self.ACCENT)
+        self._set_status("Recording paused — resume to keep adding to the same file.", color=self.ACCENT)
+
+    def _resume_recording(self):
+        if not self._recording_paused:
+            return
+        try:
+            self._recorder.resume()
+        except Exception as e:
+            messagebox.showerror("Recording Error", f"Failed to resume recording:\n{e}")
+            return
+
+        self._recording = True
+        self._recording_paused = False
+        self._pause_btn.configure(text="⏸  PAUSE")
+        self._timer_label.configure(fg=self.RED)
+        self._set_status("Recording resumed…")
+        self._tick()
+
     def _stop_recording(self):
         self._recording = False
+        self._recording_paused = False
         if self._timer_id:
             self.after_cancel(self._timer_id)
             self._timer_id = None
 
         self._rec_btn.configure(text="⏺  START RECORDING", bg=self.ACCENT, fg=self.BG,
                                 activebackground="#d4eb55")
+        self._pause_btn.configure(state="disabled", text="⏸  PAUSE")
         self._import_btn.configure(state="normal")
         self._timer_label.configure(fg=self.TEXT)
         self._set_status("Stopping — flushing audio to disk…")
@@ -845,6 +935,8 @@ class App(tk.Tk):
 
         self._rec_stopped_at = datetime.datetime.now()
         self._rec_duration = self._recorder.duration
+        self._elapsed = int(self._rec_duration)
+        self._timer_label.configure(text=self._fmt(self._elapsed))
         dropped  = self._recorder.dropped_chunks
         warnings = self._recorder.stream_warnings
 
@@ -878,15 +970,22 @@ class App(tk.Tk):
     # ── Transcription ──────────────────────────────────────────────────────
     def _start_transcribe(self):
         if self._transcribing:
-            # Button acts as cancel during transcription
+            stop_transcription = messagebox.askyesno(
+                "Cancel transcription?",
+                "Whisper transcription cannot stop instantly without discarding the result.\n\n"
+                "Canceling now will stop this run after Whisper returns, and you would need to transcribe again. Continue?"
+            )
+            if not stop_transcription:
+                return
             self._cancel_transcription.set()
-            self._set_status("Cancelling transcription…", color=self.DIM)
+            self._set_status("Cancelling transcription after the current Whisper run finishes…", color=self.DIM)
             self._trans_btn.configure(state="disabled")
             return
         if not self._wav_path:
             return
         self._transcribing = True
         self._cancel_transcription.clear()
+        self._pause_btn.configure(state="disabled")
         self._import_btn.configure(state="disabled")
         self._trans_btn.configure(text="⏹  CANCEL", bg=self.RED, fg=self.TEXT,
                                   activebackground="#cc3333")
@@ -902,6 +1001,7 @@ class App(tk.Tk):
 
     def _reset_trans_btn(self):
         """Restore TRANSCRIBE button to its normal state."""
+        self._pause_btn.configure(state="disabled", text="⏸  PAUSE")
         self._import_btn.configure(state="normal")
         self._trans_btn.configure(
             text="✦  TRANSCRIBE", bg=self.ACCENT, fg=self.BG,
@@ -1105,7 +1205,7 @@ class App(tk.Tk):
                 "A transcription is still running. Close anyway?"
             ):
                 return
-        if self._recording:
+        if self._recording or self._recording_paused:
             try:
                 self._recorder.stop()
             except Exception:
